@@ -45,6 +45,7 @@ from .exceptions import (
     UnexpectedExit,
     WatcherError,
 )
+from .stream import ChannelBuffer, StreamFragment
 from .terminals import (
     WINDOWS,
     bytes_to_read,
@@ -74,6 +75,11 @@ class Runner:
     using_pty: bool
     read_chunk_size = 1000
     input_sleep = 0.01
+    #: Maximum number of unconsumed fragments held in each channel's
+    #: `.ChannelBuffer`. Because each channel owns its own buffer, a slow
+    #: consumer on one channel only ever applies backpressure to that
+    #: channel - never to its sibling.
+    stream_buffer_limit = ChannelBuffer.DEFAULT_LIMIT
 
     def __init__(self, context: "Context") -> None:
         """
@@ -116,6 +122,11 @@ class Runner:
         #: A list of `.StreamWatcher` instances for use by `respond`. Is filled
         #: in at runtime by `run`.
         self.watchers: List["StreamWatcher"] = []
+        #: Per-channel `.ChannelBuffer` instances (keyed by channel name,
+        #: e.g. ``"stdout"``/``"stderr"``) used to hand explicitly
+        #: channel-attributed `.StreamFragment` objects from subprocess
+        #: readers to their consumers. Filled in by `create_io_threads`.
+        self.channel_buffers: Dict[str, ChannelBuffer] = {}
         # Optional timeout timer placeholder
         self._timer: Optional[threading.Timer] = None
         # Async flags (initialized for 'finally' referencing in case something
@@ -651,12 +662,20 @@ class Runner:
         """
         stdout: List[str] = []
         stderr: List[str] = []
+        # Set up per-channel bounded fragment buffers, so each channel's
+        # backpressure & EOF finalization is handled explicitly and
+        # independently of its sibling channel (and of process exit).
+        self.channel_buffers = {
+            "stdout": ChannelBuffer("stdout", limit=self.stream_buffer_limit),
+        }
         # Set up IO thread parameters (format - body_func: {kwargs})
         thread_args: Dict[Callable, Any] = {
             self.handle_stdout: {
                 "buffer_": stdout,
                 "hide": "stdout" in self.opts["hide"],
                 "output": self.streams["out"],
+                "channel": "stdout",
+                "channel_buffer": self.channel_buffers["stdout"],
             }
         }
         # After opt processing above, in_stream will be a real stream obj or
@@ -670,10 +689,15 @@ class Runner:
                 "echo": self.opts["echo_stdin"],
             }
         if not self.using_pty:
+            self.channel_buffers["stderr"] = ChannelBuffer(
+                "stderr", limit=self.stream_buffer_limit
+            )
             thread_args[self.handle_stderr] = {
                 "buffer_": stderr,
                 "hide": "stderr" in self.opts["hide"],
                 "output": self.streams["err"],
+                "channel": "stderr",
+                "channel_buffer": self.channel_buffers["stderr"],
             }
         # Kick off IO threads
         threads = {}
@@ -753,9 +777,40 @@ class Runner:
         hide: bool,
         output: IO,
         reader: Callable,
+        channel: str,
+        channel_buffer: ChannelBuffer,
     ) -> None:
         # TODO: store un-decoded/raw bytes somewhere as well...
+        # Read the subprocess' channel one fragment at a time. Each fragment
+        # is explicitly tagged with the channel it came from and placed on
+        # that channel's own bounded buffer - so if consumption below ever
+        # falls behind, the resulting backpressure only stalls *this*
+        # channel, never its sibling.
         for data in self.read_proc_output(reader):
+            channel_buffer.put(StreamFragment(channel=channel, data=data))
+            self._consume_fragments(channel_buffer, buffer_, hide, output)
+        # This channel is now at EOF: finalize the channel buffer here,
+        # separately from (and independently of) process-exit handling in
+        # wait()/returncode(), then drain any not-yet-consumed tail
+        # fragments so nothing accepted is lost.
+        channel_buffer.close()
+        self._consume_fragments(channel_buffer, buffer_, hide, output)
+
+    def _consume_fragments(
+        self,
+        channel_buffer: ChannelBuffer,
+        buffer_: List[str],
+        hide: bool,
+        output: IO,
+    ) -> None:
+        # Pull all currently-available fragments off the channel's buffer
+        # and accept them: echo to the local output stream, store in the
+        # capture buffer, and notify watchers (with channel attribution).
+        while True:
+            fragment = channel_buffer.get_nowait()
+            if fragment is None:
+                break
+            data = fragment.data
             # Echo to local stdout if necessary
             # TODO: should we rephrase this as "if you want to hide, give me a
             # dummy output stream, e.g. something like /dev/null"? Otherwise, a
@@ -768,11 +823,17 @@ class Runner:
             # NOTE: this is threadsafe insofar as no reading occurs until after
             # the thread is join()'d.
             buffer_.append(data)
-            # Run our specific buffer through the autoresponder framework
-            self.respond(buffer_)
+            # Run our specific buffer through the autoresponder framework,
+            # telling watchers exactly which channel the data came from.
+            self.respond(buffer_, channel=fragment.channel)
 
     def handle_stdout(
-        self, buffer_: List[str], hide: bool, output: IO
+        self,
+        buffer_: List[str],
+        hide: bool,
+        output: IO,
+        channel: str = "stdout",
+        channel_buffer: Optional[ChannelBuffer] = None,
     ) -> None:
         """
         Read process' stdout, storing into a buffer & printing/parsing.
@@ -785,28 +846,61 @@ class Runner:
         :param output:
             Output stream (file-like object) to write data into when not
             hiding.
+        :param str channel:
+            Name of the channel being handled; used to attribute
+            `.StreamFragment` objects and watcher errors. Defaults to
+            ``"stdout"``.
+        :param channel_buffer:
+            The `.ChannelBuffer` fragments are routed through. When
+            ``None``, a new one (bounded by `Runner.stream_buffer_limit`)
+            is created and registered in `Runner.channel_buffers`.
 
         :returns: ``None``.
 
         .. versionadded:: 1.0
         """
+        if channel_buffer is None:
+            channel_buffer = ChannelBuffer(
+                channel, limit=self.stream_buffer_limit
+            )
+            self.channel_buffers[channel] = channel_buffer
         self._handle_output(
-            buffer_, hide, output, reader=self.read_proc_stdout
+            buffer_,
+            hide,
+            output,
+            reader=self.read_proc_stdout,
+            channel=channel,
+            channel_buffer=channel_buffer,
         )
 
     def handle_stderr(
-        self, buffer_: List[str], hide: bool, output: IO
+        self,
+        buffer_: List[str],
+        hide: bool,
+        output: IO,
+        channel: str = "stderr",
+        channel_buffer: Optional[ChannelBuffer] = None,
     ) -> None:
         """
         Read process' stderr, storing into a buffer & printing/parsing.
 
-        Identical to `handle_stdout` except for the stream read from; see its
-        docstring for API details.
+        Identical to `handle_stdout` except for the stream read from (and
+        the default ``channel`` name); see its docstring for API details.
 
         .. versionadded:: 1.0
         """
+        if channel_buffer is None:
+            channel_buffer = ChannelBuffer(
+                channel, limit=self.stream_buffer_limit
+            )
+            self.channel_buffers[channel] = channel_buffer
         self._handle_output(
-            buffer_, hide, output, reader=self.read_proc_stderr
+            buffer_,
+            hide,
+            output,
+            reader=self.read_proc_stderr,
+            channel=channel,
+            channel_buffer=channel_buffer,
         )
 
     def read_our_stdin(self, input_: IO) -> Optional[str]:
@@ -929,7 +1023,9 @@ class Runner:
         """
         return (not self.using_pty) and isatty(input_)
 
-    def respond(self, buffer_: List[str]) -> None:
+    def respond(
+        self, buffer_: List[str], channel: Optional[str] = None
+    ) -> None:
         """
         Write to the program's stdin in response to patterns in ``buffer_``.
 
@@ -939,10 +1035,18 @@ class Runner:
 
         :param buffer:
             The capture buffer for this thread's particular IO stream.
+        :param channel:
+            Name of the channel (``"stdout"``/``"stderr"``) the buffer's
+            data was read from. When given, watchers are notified via their
+            channel-aware `~.StreamWatcher.submit_channel` hook, and any
+            `.WatcherError` they raise is attributed to this channel (via
+            its ``channel`` attribute) before propagating.
 
         :returns: ``None``.
 
         .. versionadded:: 1.0
+        .. versionchanged:: 3.0
+            Added the ``channel`` parameter.
         """
         # Join buffer contents into a single string; without this,
         # StreamWatcher subclasses can't do things like iteratively scan for
@@ -953,8 +1057,24 @@ class Runner:
         # is apparently even more efficient.
         stream = "".join(buffer_)
         for watcher in self.watchers:
-            for response in watcher.submit(stream):
-                self.write_proc_stdin(response)
+            # Prefer the channel-aware hook when we know which channel this
+            # data arrived on; fall back to the legacy channel-agnostic
+            # submit() for duck-typed watchers lacking the newer API.
+            submit_channel = getattr(watcher, "submit_channel", None)
+            try:
+                if channel is None or submit_channel is None:
+                    responses = watcher.submit(stream)
+                else:
+                    responses = submit_channel(channel, stream)
+                for response in responses:
+                    self.write_proc_stdin(response)
+            except WatcherError as e:
+                # Attribute the failure to the channel whose data triggered
+                # it, so callers can tell which stream a watcher was
+                # watching when it blew up.
+                if channel is not None and e.channel is None:
+                    e.channel = channel
+                raise
 
     def generate_env(
         self, env: Dict[str, Any], replace_env: bool

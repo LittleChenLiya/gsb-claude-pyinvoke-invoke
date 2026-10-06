@@ -26,6 +26,7 @@ from .loader import FilesystemLoader  # noqa
 from .parser import Argument, Parser, ParserContext, ParseResult  # noqa
 from .program import Program  # noqa
 from .runners import Failure, Local, Promise, Result, Runner  # noqa
+from .stream import ChannelBuffer, ChannelClosed, StreamFragment  # noqa
 from .tasks import Call, Task, call, task  # noqa
 from .terminals import pty_size  # noqa
 from .watchers import FailingResponder, Responder, StreamWatcher  # noqa

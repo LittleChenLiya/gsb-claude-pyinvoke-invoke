@@ -1,7 +1,12 @@
 import logging
 import os
 import sys
-import termios
+
+try:
+    import termios
+except ImportError:
+    # Not available on Windows; tests needing it skip themselves.
+    termios = None
 
 import pytest
 from unittest.mock import patch

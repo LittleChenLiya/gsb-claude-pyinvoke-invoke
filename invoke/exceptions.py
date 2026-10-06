@@ -395,7 +395,15 @@ class WatcherError(Exception):
     .. versionadded:: 1.0
     """
 
-    pass
+    #: Name of the subprocess output channel (``"stdout"`` or ``"stderr"``)
+    #: the raising watcher was processing when it failed, or ``None`` if
+    #: the failure could not be attributed to a specific channel.
+    #:
+    #: This is filled in by `.Runner` when the error propagates out of a
+    #: channel-aware watcher submission.
+    #:
+    #: .. versionadded:: 3.0
+    channel: Optional[str] = None
 
 
 class ResponseNotAccepted(WatcherError):

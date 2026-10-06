@@ -3,7 +3,12 @@ import os
 import signal
 import struct
 import sys
-import termios
+
+try:
+    import termios
+except ImportError:
+    # Not available on Windows; tests needing it skip themselves.
+    termios = None
 import threading
 import types
 from contextlib import AbstractContextManager

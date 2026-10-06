@@ -49,6 +49,31 @@ class StreamWatcher(threading.local):
         """
         raise NotImplementedError
 
+    def submit_channel(self, channel: str, stream: str) -> Iterable[str]:
+        """
+        Channel-aware variant of `submit`, called by `.Runner` IO threads.
+
+        Unlike `submit`, this hook is told exactly which subprocess channel
+        (``"stdout"`` or ``"stderr"``) the data was read from, so watchers
+        never have to guess a fragment's origin after the fact.
+
+        The default implementation simply delegates to `submit`, so
+        existing watchers keep working unchanged; subclasses interested in
+        channel attribution may override this method instead.
+
+        :param str channel:
+            Name of the channel ``stream``'s data was read from.
+        :param str stream:
+            All data read on that channel since the beginning of the
+            session.
+
+        :returns:
+            An iterable of ``str`` (which may be empty).
+
+        .. versionadded:: 3.0
+        """
+        return self.submit(stream)
+
 
 class Responder(StreamWatcher):
     """
