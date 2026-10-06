@@ -24,6 +24,15 @@ from .exceptions import (  # noqa
 from .executor import Executor  # noqa
 from .loader import FilesystemLoader  # noqa
 from .parser import Argument, Parser, ParserContext, ParseResult  # noqa
+from .planner import (  # noqa
+    AmbiguousPlanError,
+    MissingParameterError,
+    Plan,
+    PlannedCall,
+    PlanError,
+    Planner,
+    when,
+)
 from .program import Program  # noqa
 from .runners import Failure, Local, Promise, Result, Runner  # noqa
 from .tasks import Call, Task, call, task  # noqa

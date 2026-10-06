@@ -1,12 +1,15 @@
 import copy
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Tuple
 
 from .util import Lexicon, helpline
 
 from .config import merge_dicts, copy_dict
 from .parser import Context as ParserContext
 from .tasks import Task
+
+if TYPE_CHECKING:
+    from .planner import Plan
 
 
 class Collection:
@@ -412,6 +415,30 @@ class Collection:
             return self._task_with_merged_config(name, "", ours)
         # Regular task lookup
         return self.tasks[name], ours
+
+    def plan(self, *goals: Any) -> "Plan":
+        """
+        Build an explicit, non-executing invocation plan for ``goals``.
+
+        This is an opt-in alternative to `.Executor.execute`: it parses the
+        given goals, binds pre/post task parameters, validates the resulting
+        calls (missing parameters, ambiguous bindings) and deduplicates
+        shared calls by identity *including actual arguments* -- all without
+        executing any task body or dynamic condition.
+
+        :param goals:
+            Task-name strings, ``(name, kwargs)`` tuples, `.ParserContext`
+            objects, `.Call` objects or `.Task` objects. When empty, this
+            collection's default task is planned, if defined.
+
+        :returns: A `.Plan` whose ``calls`` are ready (in execution order)
+            and whose ``pending`` holds statically undeterminable entries.
+
+        .. versionadded:: 3.1
+        """
+        from .planner import Planner
+
+        return Planner(self).plan(*goals)
 
     def __contains__(self, name: str) -> bool:
         try:
