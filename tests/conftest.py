@@ -1,7 +1,13 @@
 import logging
 import os
 import sys
-import termios
+
+try:
+    import termios
+except ImportError:
+    # Not available on Windows; only the mock_termios fixture needs it, and
+    # tests using that fixture are skipped on such platforms.
+    termios = None
 
 import pytest
 from unittest.mock import patch

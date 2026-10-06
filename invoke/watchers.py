@@ -1,6 +1,6 @@
 import re
 import threading
-from typing import Generator, Iterable
+from typing import Generator, Iterable, Optional
 
 from .exceptions import ResponseNotAccepted
 
@@ -48,6 +48,32 @@ class StreamWatcher(threading.local):
         .. versionadded:: 1.0
         """
         raise NotImplementedError
+
+    def submit_channel(
+        self, stream: str, channel: Optional[str]
+    ) -> Iterable[str]:
+        """
+        Channel-aware variant of `submit`, called once per accepted fragment.
+
+        :param str stream:
+            All data read on this stream since the beginning of the session
+            (identical to what `submit` receives).
+        :param str channel:
+            The real subprocess channel the data arrived on - ``"stdout"`` or
+            ``"stderr"``. This is explicitly attributed at read time, never
+            reconstructed by merging streams and guessing afterwards.
+
+        The default implementation ignores ``channel`` and defers to
+        `submit`, so pre-existing watchers keep working unchanged. Subclasses
+        which need to know which channel a fragment came from should override
+        this method instead of `submit`.
+
+        :returns:
+            An iterable of ``str`` (which may be empty).
+
+        .. versionadded:: 3.0
+        """
+        return self.submit(stream)
 
 
 class Responder(StreamWatcher):

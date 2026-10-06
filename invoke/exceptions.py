@@ -395,7 +395,16 @@ class WatcherError(Exception):
     .. versionadded:: 1.0
     """
 
-    pass
+    def __init__(self, *args: Any, channel: Optional[str] = None) -> None:
+        super().__init__(*args)
+        #: The subprocess output channel (``"stdout"`` or ``"stderr"``) whose
+        #: stream fragment triggered this error, when known. Filled in by
+        #: `.Runner` when the watcher itself did not specify it, so failures
+        #: are always attributable to a real channel instead of requiring
+        #: guesswork after the fact.
+        #:
+        #: .. versionadded:: 3.0
+        self.channel = channel
 
 
 class ResponseNotAccepted(WatcherError):

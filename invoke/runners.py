@@ -16,6 +16,8 @@ from typing import (
     Callable,
     Dict,
     Generator,
+    Iterable,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -59,6 +61,76 @@ if TYPE_CHECKING:
     from .watchers import StreamWatcher
 
 
+class StreamBuffer:
+    """
+    Per-channel capture buffer for subprocess output fragments.
+
+    Each output channel (``stdout`` / ``stderr``) gets exactly one of these,
+    so the two channels' backpressure and retention are fully independent:
+
+    - The buffer knows its real ``channel`` at creation time, so data is
+      never merged across channels and then re-attributed by guessing.
+    - An optional ``cap`` bounds how many fragments are retained. The cap is
+      enforced synchronously inside `append` (dropping the oldest fragments,
+      preserving the tail) - it never relies on sleeping, polling or other
+      timing behavior to take effect.
+    - End-of-stream is recorded explicitly via `mark_eof`, separately from
+      process exit (which `.Runner` tracks via ``program_finished``); one
+      channel may hit EOF while the other is still producing data.
+
+    .. versionadded:: 3.0
+    """
+
+    def __init__(self, channel: str, cap: Optional[int] = None) -> None:
+        #: The real channel (``"stdout"`` or ``"stderr"``) this buffer holds.
+        self.channel = channel
+        #: Maximum number of retained fragments; ``None`` means unbounded.
+        self.cap = cap
+        #: The retained fragments, in arrival order.
+        self.chunks: List[str] = []
+        #: How many fragments were dropped due to ``cap`` enforcement.
+        self.dropped = 0
+        #: Whether this channel's stream has reached end-of-file.
+        self.eof = False
+
+    def append(self, data: str) -> None:
+        """
+        Accept a new fragment, enforcing ``cap`` immediately if configured.
+
+        When the cap is exceeded, the oldest fragments are dropped so the
+        most recent tail of the stream is always preserved.
+        """
+        self.chunks.append(data)
+        if self.cap is not None:
+            while len(self.chunks) > self.cap:
+                self.chunks.pop(0)
+                self.dropped += 1
+
+    def mark_eof(self) -> None:
+        """
+        Record that this channel's stream reached end-of-file.
+
+        Called by the channel's IO thread when its reads run dry; this is
+        deliberately decoupled from subprocess exit and from the sibling
+        channel's state.
+        """
+        self.eof = True
+
+    def join(self) -> str:
+        """
+        Return all retained fragments joined into a single string.
+        """
+        return "".join(self.chunks)
+
+    def __iter__(self) -> "Iterator[str]":
+        # Iterate over a snapshot; reading typically happens from another
+        # thread (or after join()) and must not explode if appends continue.
+        return iter(list(self.chunks))
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+
 class Runner:
     """
     Partially-abstract core command-running API.
@@ -74,6 +146,7 @@ class Runner:
     using_pty: bool
     read_chunk_size = 1000
     input_sleep = 0.01
+    stream_buffer_cap: Optional[int] = None
 
     def __init__(self, context: "Context") -> None:
         """
@@ -111,6 +184,11 @@ class Runner:
         #: How many seconds to sleep on each iteration of the stdin read loop
         #: and other otherwise-fast loops.
         self.input_sleep = self.__class__.input_sleep
+        #: Maximum number of output fragments retained per channel buffer
+        #: (``None``, the default, means unbounded and preserves historical
+        #: behavior). Each channel gets its own `StreamBuffer` with its own
+        #: cap, so retention limits never leak across channels.
+        self.stream_buffer_cap = self.__class__.stream_buffer_cap
         #: Whether pty fallback warning has been emitted.
         self.warned_about_pty_fallback = False
         #: A list of `.StreamWatcher` instances for use by `respond`. Is filled
@@ -378,6 +456,11 @@ class Runner:
             (typically ``bytes`` objects) in response to patterns or other
             heuristics.
 
+            Watchers are notified once per accepted output fragment, per real
+            channel; those implementing `.StreamWatcher.submit_channel` are
+            additionally told which channel (``"stdout"`` or ``"stderr"``)
+            each fragment arrived on.
+
             See :doc:`/concepts/watchers` for details on this functionality.
 
             Default: ``[]``.
@@ -642,21 +725,28 @@ class Runner:
 
     def create_io_threads(
         self,
-    ) -> Tuple[Dict[Callable, ExceptionHandlingThread], List[str], List[str]]:
+    ) -> Tuple[
+        Dict[Callable, ExceptionHandlingThread], StreamBuffer, StreamBuffer
+    ]:
         """
         Create and return a dictionary of IO thread worker objects.
 
         Caller is expected to handle persisting and/or starting the wrapped
         threads.
+
+        The two output channels each get their own `StreamBuffer`, created
+        with the real channel name up front; nothing is ever merged and then
+        re-attributed by guessing.
         """
-        stdout: List[str] = []
-        stderr: List[str] = []
+        stdout = StreamBuffer("stdout", cap=self.stream_buffer_cap)
+        stderr = StreamBuffer("stderr", cap=self.stream_buffer_cap)
         # Set up IO thread parameters (format - body_func: {kwargs})
         thread_args: Dict[Callable, Any] = {
             self.handle_stdout: {
                 "buffer_": stdout,
                 "hide": "stdout" in self.opts["hide"],
                 "output": self.streams["out"],
+                "channel": "stdout",
             }
         }
         # After opt processing above, in_stream will be a real stream obj or
@@ -674,6 +764,7 @@ class Runner:
                 "buffer_": stderr,
                 "hide": "stderr" in self.opts["hide"],
                 "output": self.streams["err"],
+                "channel": "stderr",
             }
         # Kick off IO threads
         threads = {}
@@ -749,10 +840,11 @@ class Runner:
 
     def _handle_output(
         self,
-        buffer_: List[str],
+        buffer_: StreamBuffer,
         hide: bool,
         output: IO,
         reader: Callable,
+        channel: str,
     ) -> None:
         # TODO: store un-decoded/raw bytes somewhere as well...
         for data in self.read_proc_output(reader):
@@ -764,15 +856,29 @@ class Runner:
             if not hide:
                 self.write_our_output(stream=output, string=data)
             # Store in shared buffer so main thread can do things with the
-            # result after execution completes.
+            # result after execution completes. This is also where any
+            # per-channel buffer cap is enforced, synchronously.
             # NOTE: this is threadsafe insofar as no reading occurs until after
             # the thread is join()'d.
             buffer_.append(data)
-            # Run our specific buffer through the autoresponder framework
-            self.respond(buffer_)
+            # Run our specific buffer through the autoresponder framework,
+            # telling watchers exactly which channel the fragment came from.
+            # NOTE: a slow or blocked consumer (output stream or watcher)
+            # only applies backpressure to *this* channel's thread; the
+            # sibling channel has its own thread and buffer and keeps
+            # flowing.
+            self.respond(buffer_, channel)
+        # This channel's stream hit EOF: finalize just this channel. Process
+        # exit is tracked separately (see wait()/program_finished) and the
+        # sibling channel finalizes on its own schedule.
+        buffer_.mark_eof()
 
     def handle_stdout(
-        self, buffer_: List[str], hide: bool, output: IO
+        self,
+        buffer_: StreamBuffer,
+        hide: bool,
+        output: IO,
+        channel: str = "stdout",
     ) -> None:
         """
         Read process' stdout, storing into a buffer & printing/parsing.
@@ -785,17 +891,28 @@ class Runner:
         :param output:
             Output stream (file-like object) to write data into when not
             hiding.
+        :param str channel:
+            Real channel name attributed to fragments and watchers; defaults
+            to ``"stdout"``.
 
         :returns: ``None``.
 
         .. versionadded:: 1.0
         """
         self._handle_output(
-            buffer_, hide, output, reader=self.read_proc_stdout
+            buffer_,
+            hide,
+            output,
+            reader=self.read_proc_stdout,
+            channel=channel,
         )
 
     def handle_stderr(
-        self, buffer_: List[str], hide: bool, output: IO
+        self,
+        buffer_: StreamBuffer,
+        hide: bool,
+        output: IO,
+        channel: str = "stderr",
     ) -> None:
         """
         Read process' stderr, storing into a buffer & printing/parsing.
@@ -806,7 +923,11 @@ class Runner:
         .. versionadded:: 1.0
         """
         self._handle_output(
-            buffer_, hide, output, reader=self.read_proc_stderr
+            buffer_,
+            hide,
+            output,
+            reader=self.read_proc_stderr,
+            channel=channel,
         )
 
     def read_our_stdin(self, input_: IO) -> Optional[str]:
@@ -929,7 +1050,9 @@ class Runner:
         """
         return (not self.using_pty) and isatty(input_)
 
-    def respond(self, buffer_: List[str]) -> None:
+    def respond(
+        self, buffer_: Iterable[str], channel: Optional[str] = None
+    ) -> None:
         """
         Write to the program's stdin in response to patterns in ``buffer_``.
 
@@ -940,9 +1063,23 @@ class Runner:
         :param buffer:
             The capture buffer for this thread's particular IO stream.
 
+        :param channel:
+            The real channel (``"stdout"`` or ``"stderr"``) the buffer's data
+            arrived on. Watchers implementing
+            `.StreamWatcher.submit_channel` receive this verbatim, so they
+            never need to merge streams and guess origins. When ``None``,
+            watchers are still called but channel attribution is unavailable.
+
+            Any `.WatcherError` raised by a watcher is annotated with this
+            channel (unless the watcher already set one) before propagating,
+            so failures are attributable to the channel that triggered them.
+
         :returns: ``None``.
 
         .. versionadded:: 1.0
+        .. versionchanged:: 3.0
+            Added the ``channel`` parameter and channel-aware watcher
+            dispatch.
         """
         # Join buffer contents into a single string; without this,
         # StreamWatcher subclasses can't do things like iteratively scan for
@@ -953,7 +1090,22 @@ class Runner:
         # is apparently even more efficient.
         stream = "".join(buffer_)
         for watcher in self.watchers:
-            for response in watcher.submit(stream):
+            # Prefer the channel-aware hook when the watcher provides one
+            # (all StreamWatcher subclasses do); fall back to the legacy
+            # submit() for duck-typed watcher objects.
+            submit_channel = getattr(watcher, "submit_channel", None)
+            try:
+                if submit_channel is not None:
+                    responses = submit_channel(stream, channel)
+                else:
+                    responses = watcher.submit(stream)
+            except WatcherError as e:
+                # Attribute the failure to the real channel whose fragment
+                # triggered it, unless the watcher already attributed it.
+                if getattr(e, "channel", None) is None:
+                    e.channel = channel
+                raise
+            for response in responses:
                 self.write_proc_stdin(response)
 
     def generate_env(

@@ -2,6 +2,14 @@
 Changelog
 =========
 
+- :feature:`-` Subprocess stdout/stderr handling is now explicitly
+  per-channel: each stream gets its own `~invoke.runners.StreamBuffer` (with
+  an optional, synchronously-enforced fragment cap and independent EOF
+  finalization), watchers can implement
+  `~invoke.watchers.StreamWatcher.submit_channel` to receive fragments tagged
+  with the real channel they arrived on, and `~invoke.exceptions.WatcherError`
+  failures are annotated with the channel that raised them (without losing
+  tail data already accepted on the sibling channel).
 - :release:`3.0.3 <2026-04-07>`
 - :support:`- backported` Reverted the `@task
   <invoke.tasks.task>` return value type hint change; it actually just makes
