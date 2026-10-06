@@ -6,6 +6,7 @@ from .util import Lexicon, helpline
 
 from .config import merge_dicts, copy_dict
 from .parser import Context as ParserContext
+from .planning import Planner, TaskPlan
 from .tasks import Task
 
 
@@ -419,6 +420,31 @@ class Collection:
             return True
         except KeyError:
             return False
+
+    def plan(self, *goals: Any) -> "TaskPlan":
+        """
+        Build an explicit `.TaskPlan` for ``goals``, executing nothing.
+
+        This is an opt-in alternative to `.Executor`: it statically resolves
+        the goal/pre/post call graph, binds pre- and post-task parameters,
+        and reports missing or ambiguous parameters as plan errors - all
+        before (in fact, without ever) running any task body. Conditional
+        post tasks (`.ConditionalCall`, see `.when`) only enter the plan when
+        their declared condition is satisfied; conditions that cannot be
+        determined statically yield *pending* plan entries instead of
+        triggering execution to obtain an answer.
+
+        ``goals`` accepts the same value types as `.Executor.execute`: task
+        name strings, ``(name, kwargs)`` tuples, `.ParserContext` objects or
+        `.Call` objects. With no goals, the collection's default task is
+        planned, if any.
+
+        :returns: a `.TaskPlan`; check ``.ok``/``.errors`` and inspect
+            ``.counts`` for per-task planned execution counts.
+
+        .. versionadded:: 3.1
+        """
+        return Planner(self).plan(*goals)
 
     def to_contexts(
         self, ignore_unknown_help: Optional[bool] = None
