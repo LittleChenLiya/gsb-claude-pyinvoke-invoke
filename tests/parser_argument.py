@@ -98,6 +98,17 @@ class Argument_:
             with raises(ValueError):
                 Argument("a", kind=int).value = "five"
 
+        def cast_failure_message_is_what_parser_wraps(self):
+            # Regression: this interface still raises the original ValueError
+            # verbatim; Parser.parse_argv wraps it in ParseError with argv
+            # index/token (see parser_parser type_cast_errors tests).
+            try:
+                Argument("a", kind=int).value = "x"
+            except ValueError as e:
+                assert str(e) == "invalid literal for int() with base 10: 'x'"
+            else:
+                assert False, "Did not raise ValueError!"
+
         def list_implies_initial_value_of_empty_list(self):
             assert Argument("mylist", kind=list).value == []
 

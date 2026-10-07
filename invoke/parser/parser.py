@@ -1,5 +1,5 @@
 import copy
-from typing import TYPE_CHECKING, Any, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple
 
 try:
     from ..vendor.lexicon import Lexicon
@@ -131,7 +131,15 @@ class Parser:
             debug(
                 "Remainder: argv[{!r}:][1:] => {!r}".format(ddash, remainder)
             )
+        # Track, for each token in 'body', where it came from in the original
+        # argv (index + verbatim token), so errors raised mid-parse can point
+        # back at what the user actually typed - even when x=y splitting or
+        # short-flag-cluster expansion inserted sub-tokens into 'body'.
+        # (Kept local to this call, so reusing a Parser never sees stale
+        # positions from a previous, possibly failed, parse.)
+        origins: List[Tuple[int, str]] = list(enumerate(body))
         for index, token in enumerate(body):
+            argv_index, argv_token = origins[index]
             # Handle non-space-delimited forms, if not currently expecting a
             # flag value and still in valid parsing territory (i.e. not in
             # "unknown" state which implies store-only)
@@ -195,7 +203,22 @@ class Parser:
                     mutations = []
             for index, value in mutations:
                 body.insert(index, value)
-            machine.handle(token)
+                origins.insert(index, (argv_index, argv_token))
+            expecting_value = machine.waiting_for_flag_value
+            try:
+                machine.handle(token)
+            except ValueError as e:
+                # Option value type-cast failures (e.g. kind=int given 'x')
+                # surface from Argument.value-setter as ValueError; re-raise
+                # as our regular parse error type, annotated with the
+                # original argv index & token for easier debugging.
+                flag = machine.flag if expecting_value else None
+                name = flag.name if flag is not None else token
+                err = "Invalid value for flag {!r}: {} (argv[{}] was {!r})"
+                raise ParseError(
+                    err.format(name, e, argv_index, argv_token),
+                    machine.context,
+                ) from e
         machine.finish()
         result = machine.result
         result.remainder = " ".join(remainder)

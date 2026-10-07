@@ -273,6 +273,72 @@ class Parser_:
             def does_not_require_escaping_equals_signs_in_value(self) -> None:
                 self._compare("f", "-f=biz=baz", "biz=baz")
 
+        class type_cast_errors:
+            "option type-cast failures"
+            def _parser(self) -> Parser:
+                arg = Argument(names=("n", "num"), kind=int)
+                return Parser(contexts=[Context("mytask", args=(arg,))])
+
+            def _error(self, argv: list) -> ParseError:
+                try:
+                    self._parser().parse_argv(argv)
+                except ParseError as e:
+                    return e
+                assert False, "Did not raise ParseError!"  # noqa
+
+            def equals_style_long_flag_reports_argv_index_and_token(
+                self,
+            ) -> None:
+                e = self._error(["mytask", "--num=x"])
+                assert "argv[1]" in str(e)
+                assert "'--num=x'" in str(e)
+                assert "invalid literal for int()" in str(e)
+
+            def separate_value_reports_argv_index_and_token(self) -> None:
+                e = self._error(["mytask", "--num", "x"])
+                assert "argv[2]" in str(e)
+                assert "'x'" in str(e)
+
+            def short_flag_cluster_reports_argv_index_and_token(self) -> None:
+                e = self._error(["mytask", "-nx"])
+                assert "argv[1]" in str(e)
+                assert "'-nx'" in str(e)
+
+            def equals_style_short_flag_reports_argv_index_and_token(
+                self,
+            ) -> None:
+                e = self._error(["mytask", "-n=x"])
+                assert "argv[1]" in str(e)
+                assert "'-n=x'" in str(e)
+
+            def error_is_ParseError_with_context_attached(self) -> None:
+                e = self._error(["mytask", "--num=x"])
+                assert isinstance(e, ParseError)
+                assert not isinstance(e, ValueError)
+                assert e.context is not None
+                assert e.context.name == "mytask"
+
+            def double_dash_remainder_is_not_cast(self) -> None:
+                r = self._parser().parse_argv(["mytask", "--", "--num=x"])
+                assert r.remainder == "--num=x"
+                assert r[0].args["n"].value is None
+
+            def parser_reuse_leaves_no_stale_position(self) -> None:
+                p = self._parser()
+                with raises(ParseError):
+                    p.parse_argv(["mytask", "--num=x"])
+                # A later, successful parse works and sees no old position.
+                r = p.parse_argv(["mytask", "--num", "5"])
+                assert r[0].args["n"].value == 5
+                # And a later failure reports its own coordinates only.
+                try:
+                    p.parse_argv(["mytask", "--num", "y"])
+                except ParseError as e:
+                    assert "argv[2]" in str(e)
+                    assert "'y'" in str(e)
+                else:
+                    assert False, "Did not raise ParseError!"
+
         def handles_multiple_boolean_flags_per_context(self) -> None:
             c = Context(
                 "mytask",
