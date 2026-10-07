@@ -131,6 +131,14 @@ class Parser:
             debug(
                 "Remainder: argv[{!r}:][1:] => {!r}".format(ddash, remainder)
             )
+        # Parallel bookkeeping to 'body': origins[position] is the
+        # (original argv index, original argv token) that the body token at
+        # that position came from. It starts in lockstep with 'body' and gets
+        # the same insertions applied below, so error handlers can point back
+        # at the raw user input even when tokens were split (--n=x) or peeled
+        # apart (-nx). Note the post-'--' remainder never reaches the loop, so
+        # its literals are never converted and never get an origin here.
+        origins = list(enumerate(body))
         for index, token in enumerate(body):
             # Handle non-space-delimited forms, if not currently expecting a
             # flag value and still in valid parsing territory (i.e. not in
@@ -140,13 +148,14 @@ class Parser:
             # previously seen flag optionally takes a value.
             mutations = []
             orig = token
+            origin = origins[index]
             if is_flag(token) and not machine.result.unparsed:
                 # Equals-sign-delimited flags, eg --foo=bar or -f=bar
                 if "=" in token:
                     token, _, value = token.partition("=")
                     msg = "Splitting x=y expr {!r} into tokens {!r} and {!r}"
                     debug(msg.format(orig, token, value))
-                    mutations.append((index + 1, value))
+                    mutations.append((index + 1, value, origin))
                 # Contiguous boolean short flags, e.g. -qv
                 elif not is_long_flag(token) and len(token) > 2:
                     full_token = token[:]
@@ -164,13 +173,13 @@ class Parser:
                     if have_flag and machine.context.flags[token].takes_value:
                         msg = "{!r} is a flag for current context & it takes a value, giving it {!r}"  # noqa
                         debug(msg.format(token, rest))
-                        mutations.append((index + 1, rest))
+                        mutations.append((index + 1, rest, origin))
                     else:
                         _rest = ["-{}".format(x) for x in rest]
                         msg = "Splitting multi-flag glob {!r} into {!r} and {!r}"  # noqa
                         debug(msg.format(orig, token, _rest))
                         for item in reversed(_rest):
-                            mutations.append((index + 1, item))
+                            mutations.append((index + 1, item, origin))
             # Here, we've got some possible mutations queued up, and 'token'
             # may have been overwritten as well. Whether we apply those and
             # continue as-is, or roll it back, depends:
@@ -193,8 +202,12 @@ class Parser:
                 if not (optional and subtoken_is_valid_flag):
                     token = orig
                     mutations = []
-            for index, value in mutations:
-                body.insert(index, value)
+            for insert_at, value, value_origin in mutations:
+                body.insert(insert_at, value)
+                origins.insert(insert_at, value_origin)
+            # Expose where this (possibly split-off) token originally came from,
+            # so a conversion failure below can report the raw argv location.
+            machine.argv_index, machine.token = origin
             machine.handle(token)
         machine.finish()
         result = machine.result
@@ -238,6 +251,11 @@ class ParseMachine(StateMachine):
         debug("Initialized with context: {!r}".format(self.context))
         self.flag = None
         self.flag_got_value = False
+        # Origin (argv index & raw token) of the token currently being handled.
+        # Reset for every parse_argv() run (each run makes a new machine), so
+        # reusing a Parser never leaks a previous run's position.
+        self.argv_index: Optional[int] = None
+        self.token: Optional[str] = None
         self.result = ParseResult()
         self.contexts = copy.deepcopy(contexts)
         debug("Available contexts: {!r}".format(self.contexts))
@@ -440,7 +458,19 @@ class ParseMachine(StateMachine):
         self.check_ambiguity(value)
         if self.flag and self.flag.takes_value:
             debug("Setting flag {!r} to value {!r}".format(self.flag, value))
-            self.flag.value = value
+            try:
+                self.flag.value = value
+            except (ValueError, TypeError) as e:
+                # Keep this a parser-level error (so callers only have to catch
+                # ParseError) while pointing at the raw argv location that
+                # failed to convert. The original conversion error is preserved
+                # as the cause for introspection.
+                raise ParseError(
+                    str(e),
+                    self.context,
+                    argv_index=self.argv_index,
+                    token=self.token,
+                ) from e
             self.flag_got_value = True
         else:
             self.error("Flag {!r} doesn't take any value!".format(self.flag))

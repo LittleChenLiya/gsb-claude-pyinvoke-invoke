@@ -392,6 +392,60 @@ class Parser_:
                 p = Parser([c1, c2])
                 self._test_for_ambiguity("--foo othertask", p)
 
+    class value_conversion_errors:
+        "values that fail to convert to the option's kind"
+
+        def setup_method(self) -> None:
+            self.context = Context(args=(Argument(names=("num", "n"), kind=int),))
+            self.parser = Parser(initial=self.context)
+
+        def _fail(self, argv):
+            with raises(ParseError) as info:
+                self.parser.parse_argv(list(argv))
+            return info.value
+
+        def equals_form_reports_original_index_and_token(self) -> None:
+            err = self._fail(["--num=x"])
+            assert err.argv_index == 0
+            assert err.token == "--num=x"
+
+        def separate_value_form_reports_original_index_and_token(self) -> None:
+            err = self._fail(["--num", "x"])
+            assert err.argv_index == 1
+            assert err.token == "x"
+
+        def short_combo_form_reports_original_index_and_token(self) -> None:
+            err = self._fail(["-nx"])
+            assert err.argv_index == 0
+            assert err.token == "-nx"
+
+        def short_separate_value_form_reports_index_and_token(self) -> None:
+            err = self._fail(["-n", "x"])
+            assert err.argv_index == 1
+            assert err.token == "x"
+
+        def remains_a_ParseError_with_original_cause(self) -> None:
+            err = self._fail(["--num=x"])
+            assert isinstance(err, ParseError)
+            assert isinstance(err.__cause__, ValueError)
+
+        def double_dash_literals_are_not_converted(self) -> None:
+            for argv in (["--", "--num=x"], ["--", "-nx"]):
+                result = self.parser.parse_argv(list(argv))
+                assert result.remainder == argv[1]
+
+        def reusing_parser_does_not_leak_prior_location(self) -> None:
+            # A failure at index 0 ...
+            err = self._fail(["-nx"])
+            assert err.argv_index == 0
+            # ... followed by a successful parse ...
+            result = self.parser.parse_argv(["--num", "7"])
+            assert result[0].args.num.value == 7
+            # ... must not leave stale position info on a later failure.
+            err = self._fail(["--num", "nope"])
+            assert err.argv_index == 1
+            assert err.token == "nope"
+
     class list_type_arguments:
         "list-type (iterable) arguments"
 

@@ -198,10 +198,20 @@ class ParseError(Exception):
     """
 
     def __init__(
-        self, msg: str, context: Optional["ParserContext"] = None
+        self,
+        msg: str,
+        context: Optional["ParserContext"] = None,
+        argv_index: Optional[int] = None,
+        token: Optional[str] = None,
     ) -> None:
         super().__init__(msg)
         self.context = context
+        # Index (into the argv list handed to the parser) of the token that
+        # triggered this error, plus that token's original, pre-splitting text.
+        # Only populated for errors tied to a specific input token, such as
+        # failed option value type conversions.
+        self.argv_index = argv_index
+        self.token = token
 
 
 class Exit(Exception):
