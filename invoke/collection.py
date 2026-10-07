@@ -1,12 +1,32 @@
 import copy
 from types import ModuleType
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 from .util import Lexicon, helpline
 
 from .config import merge_dicts, copy_dict
+from .exceptions import AliasResolutionError
 from .parser import Context as ParserContext
 from .tasks import Task
+
+
+class AliasDiagnostic(NamedTuple):
+    """
+    A single alias-resolution problem found by `Collection.diagnose_aliases`.
+
+    ``kind`` is either ``"cycle"`` (the alias chain loops back on itself) or
+    ``"missing-target"`` (the chain ends at a name no task is bound to).
+
+    ``chain`` is the full resolution path, fully qualified with any
+    subcollection prefixes. For cycles, the final element repeats the first
+    element of the loop, e.g. ``("a", "b", "a")``; for missing targets, the
+    final element is the unresolvable name.
+
+    .. versionadded:: 3.1
+    """
+
+    kind: str
+    chain: Tuple[str, ...]
 
 
 class Collection:
@@ -378,7 +398,7 @@ class Collection:
         return task, dict(config, **ours)
 
     def task_with_config(
-        self, name: Optional[str]
+        self, name: Optional[str], check_aliases: bool = False
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Return task named ``name`` plus its configuration dict.
@@ -390,10 +410,21 @@ class Collection:
 
         See `~.Collection.__getitem__` for semantics of the ``name`` argument.
 
+        :param bool check_aliases:
+            Opt-in preflight: when ``True``, run `.check_aliases` over the
+            entire collection tree before performing the lookup, raising
+            `~.exceptions.AliasResolutionError` (which reports the full
+            offending alias chains) instead of recursing forever on cyclic
+            aliases. Defaults to ``False``, preserving historical behavior.
+
         :returns: Two-tuple of (`.Task`, `dict`).
 
         .. versionadded:: 1.0
+        .. versionchanged:: 3.1
+            Added the ``check_aliases`` kwarg.
         """
+        if check_aliases:
+            self.check_aliases()
         # Our top level configuration
         ours = self.configuration()
         # Default task for this collection itself
@@ -412,6 +443,91 @@ class Collection:
             return self._task_with_merged_config(name, "", ours)
         # Regular task lookup
         return self.tasks[name], ours
+
+    def diagnose_aliases(self) -> List[AliasDiagnostic]:
+        """
+        Preflight alias resolution for this collection and its subcollections.
+
+        Walks every alias chain in the collection tree (without executing any
+        task bodies and without modifying the collection) and returns a list
+        of `AliasDiagnostic` tuples describing any problems found:
+
+        * ``kind="cycle"``: aliases pointing at one another in a loop. The
+          diagnostic's ``chain`` holds the full cycle, e.g. ``("a", "b",
+          "a")`` for a two-node cycle or ``("a", "a")`` for a self-loop.
+        * ``kind="missing-target"``: an alias whose chain ends at a name no
+          task is bound to. The final chain element is the missing name.
+
+        Legal aliases - including aliases of tasks within nested
+        subcollections - resolve cleanly and yield no diagnostics. Chains
+        belonging to subcollections are reported with dotted, fully qualified
+        names, e.g. ``("sub.a", "sub.b", "sub.a")``.
+
+        :returns:
+            A list of `AliasDiagnostic` tuples; empty when every alias in the
+            tree resolves to a real task.
+
+        .. versionadded:: 3.1
+        """
+        return self._alias_diagnostics()
+
+    def _alias_diagnostics(self, prefix: str = "") -> List[AliasDiagnostic]:
+        problems: List[AliasDiagnostic] = []
+        aliases = self.tasks.aliases
+        seen_cycles = set()
+        for alias, target in aliases.items():
+            chain = [alias]
+            visited = {alias}
+            current = target
+            while True:
+                chain.append(current)
+                if current in visited:
+                    start = chain.index(current)
+                    cycle = tuple(chain[start:])
+                    key = frozenset(cycle)
+                    if key not in seen_cycles:
+                        seen_cycles.add(key)
+                        problems.append(
+                            AliasDiagnostic(
+                                "cycle",
+                                tuple(prefix + x for x in cycle),
+                            )
+                        )
+                    break
+                visited.add(current)
+                # Alias-to-alias hop: keep following the chain.
+                if current in aliases:
+                    current = aliases[current]
+                    continue
+                # Chain's end: healthy if it names a real task, else dangling.
+                if current not in self.tasks:
+                    problems.append(
+                        AliasDiagnostic(
+                            "missing-target",
+                            tuple(prefix + x for x in chain),
+                        )
+                    )
+                break
+        # Recurse so legal aliases within nested collections resolve in their
+        # own scope, and any problems surface with dotted paths.
+        for name, coll in self.collections.items():
+            problems.extend(coll._alias_diagnostics(prefix + name + "."))
+        return problems
+
+    def check_aliases(self) -> None:
+        """
+        Raise `~.exceptions.AliasResolutionError` if any alias is broken.
+
+        Runs `.diagnose_aliases` and raises when its result is non-empty; the
+        exception reports the full alias chain of every cycle or dangling
+        target found. Does nothing (and modifies nothing) when all aliases
+        resolve to real tasks.
+
+        .. versionadded:: 3.1
+        """
+        problems = self.diagnose_aliases()
+        if problems:
+            raise AliasResolutionError(problems)
 
     def __contains__(self, name: str) -> bool:
         try:

@@ -3,7 +3,8 @@ from functools import reduce
 
 from pytest import raises
 
-from invoke.collection import Collection
+from invoke.collection import AliasDiagnostic, Collection
+from invoke.exceptions import AliasResolutionError
 from invoke.tasks import task, Task
 
 from _util import load, support_path
@@ -446,6 +447,121 @@ class Collection_:
             self.c.add_collection(Collection("whatever"))
             with raises(ValueError):
                 self.c["whatever"]
+
+    class alias_preflight:
+        "diagnose_aliases / check_aliases / task_with_config(check_aliases)"
+
+        def setup_method(self):
+            self.calls = []
+
+            def body(c):
+                self.calls.append(c)
+
+            self.body = body
+            self.c = Collection()
+
+        def _cyclic_ns(self):
+            # Two-node cycle (a <-> b) plus one real task, in a subcollection
+            inner = Collection("inner")
+            inner.add_task(Task(self.body, name="real"))
+            inner.tasks.alias("a", to="b")
+            inner.tasks.alias("b", to="a")
+            self.c.add_collection(inner)
+            return inner
+
+        def two_node_cycle_reports_full_chain(self):
+            self._cyclic_ns()
+            problems = self.c.diagnose_aliases()
+            assert problems == [
+                AliasDiagnostic("cycle", ("inner.a", "inner.b", "inner.a"))
+            ]
+
+        def two_node_cycle_raises_with_full_chain_in_message(self):
+            self._cyclic_ns()
+            with raises(AliasResolutionError) as info:
+                self.c.check_aliases()
+            assert "inner.a -> inner.b -> inner.a" in str(info.value)
+            assert info.value.diagnostics[0].kind == "cycle"
+
+        def self_loop_reports_full_chain(self):
+            self.c.add_task(Task(self.body, name="real"))
+            self.c.tasks.alias("loopy", to="loopy")
+            problems = self.c.diagnose_aliases()
+            assert problems == [AliasDiagnostic("cycle", ("loopy", "loopy"))]
+
+        def cycle_is_reported_once_despite_two_alias_entries(self):
+            self.c.tasks.alias("a", to="b")
+            self.c.tasks.alias("b", to="a")
+            kinds = [x.kind for x in self.c.diagnose_aliases()]
+            assert kinds == ["cycle"]
+
+        def missing_target_reports_chain_to_dangling_name(self):
+            self.c.add_task(Task(self.body, name="real"))
+            self.c.tasks.alias("ghost", to="nope")
+            problems = self.c.diagnose_aliases()
+            assert problems == [
+                AliasDiagnostic("missing-target", ("ghost", "nope"))
+            ]
+            with raises(AliasResolutionError) as info:
+                self.c.check_aliases()
+            assert "'nope' not found: ghost -> nope" in str(info.value)
+
+        def nested_legal_aliases_yield_no_diagnostics(self):
+            inner = Collection("inner")
+            inner.add_task(Task(self.body, name="build", aliases=("b",)))
+            inner.tasks.alias("compile", to="build")
+            self.c.add_task(Task(self.body, name="top", aliases=("t",)))
+            self.c.add_collection(inner)
+            assert self.c.diagnose_aliases() == []
+            # No exception either
+            self.c.check_aliases()
+            # And the legal aliases still resolve, nested included
+            assert self.c["inner.compile"] is inner.tasks["build"]
+            assert self.c["t"] is self.c.tasks["top"]
+
+        def preflight_never_executes_task_bodies(self):
+            self._cyclic_ns()
+            self.c.diagnose_aliases()
+            with raises(AliasResolutionError):
+                self.c.check_aliases()
+            assert self.calls == []
+
+        def failed_preflight_does_not_modify_collection(self):
+            inner = self._cyclic_ns()
+            before = (
+                dict(self.c.tasks),
+                dict(self.c.tasks.aliases),
+                dict(self.c.collections),
+                dict(inner.tasks),
+                dict(inner.tasks.aliases),
+            )
+            with raises(AliasResolutionError):
+                self.c.check_aliases()
+            after = (
+                dict(self.c.tasks),
+                dict(self.c.tasks.aliases),
+                dict(self.c.collections),
+                dict(inner.tasks),
+                dict(inner.tasks.aliases),
+            )
+            assert before == after
+
+        def task_with_config_opt_in_runs_preflight(self):
+            self._cyclic_ns()
+            with raises(AliasResolutionError):
+                self.c.task_with_config("inner.a", check_aliases=True)
+
+        def task_with_config_default_skips_preflight_and_keeps_shape(self):
+            inner = Collection("inner")
+            task = Task(self.body, name="real", aliases=("r",))
+            inner.add_task(task)
+            self.c.add_collection(inner)
+            # New option not enabled: original interface & return shape
+            found, config = self.c.task_with_config("inner.r")
+            assert found is task
+            assert config == {}
+            # __getitem__ untouched as well
+            assert self.c["inner.r"] is task
 
     class to_contexts:
         def setup_method(self):

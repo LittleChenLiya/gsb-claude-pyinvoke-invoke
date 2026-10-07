@@ -11,6 +11,7 @@ from traceback import format_exception
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
+    from .collection import AliasDiagnostic
     from .parser import ParserContext
     from .runners import Result
     from .util import ExceptionWrapper
@@ -20,6 +21,34 @@ class CollectionNotFound(Exception):
     def __init__(self, name: str, start: str) -> None:
         self.name = name
         self.start = start
+
+
+class AliasResolutionError(ValueError):
+    """
+    Raised when alias preflight detects unresolvable task aliases.
+
+    Carries the offending `~invoke.collection.AliasDiagnostic` tuples on its
+    ``diagnostics`` attribute; each diagnostic's ``chain`` holds the full
+    resolution path (e.g. ``("a", "b", "a")`` for a two-node cycle), and the
+    stringified exception renders those chains in ``a -> b -> a`` form.
+
+    .. versionadded:: 3.1
+    """
+
+    def __init__(self, diagnostics: "List[AliasDiagnostic]") -> None:
+        self.diagnostics = diagnostics
+        messages = []
+        for diagnostic in diagnostics:
+            chain = " -> ".join(diagnostic.chain)
+            if diagnostic.kind == "cycle":
+                messages.append("alias cycle detected: {}".format(chain))
+            else:
+                messages.append(
+                    "alias target {!r} not found: {}".format(
+                        diagnostic.chain[-1], chain
+                    )
+                )
+        super().__init__("\n".join(messages))
 
 
 class Failure(Exception):

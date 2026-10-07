@@ -1,10 +1,11 @@
 from importlib import metadata
 from typing import Any
 
-from .collection import Collection  # noqa
+from .collection import AliasDiagnostic, Collection  # noqa
 from .config import Config  # noqa
 from .context import Context, MockContext  # noqa
 from .exceptions import (  # noqa
+    AliasResolutionError,
     AmbiguousEnvVar,
     AuthFailure,
     CollectionNotFound,
