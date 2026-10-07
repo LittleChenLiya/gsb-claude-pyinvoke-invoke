@@ -22,6 +22,49 @@ class CollectionNotFound(Exception):
         self.start = start
 
 
+class AliasResolutionError(Exception):
+    """
+    Base class for alias preflight failures in `.Collection`.
+
+    .. versionadded:: 3.1
+    """
+
+
+class AliasCycleError(AliasResolutionError):
+    """
+    An alias (or chain of aliases) resolves back onto itself.
+
+    The full cycle chain is available as the ``chain`` attribute, e.g.
+    ``["a", "b", "a"]`` for a two-node cycle between ``a`` and ``b``.
+
+    .. versionadded:: 3.1
+    """
+
+    def __init__(self, chain: List[str]) -> None:
+        self.chain = list(chain)
+        super().__init__(
+            "Alias cycle detected: {}".format(" -> ".join(self.chain))
+        )
+
+
+class MissingAliasTargetError(AliasResolutionError):
+    """
+    An alias points at a name which does not exist in its collection.
+
+    The offending alias and its unresolvable target are available as the
+    ``alias`` and ``target`` attributes.
+
+    .. versionadded:: 3.1
+    """
+
+    def __init__(self, alias: str, target: str) -> None:
+        self.alias = alias
+        self.target = target
+        super().__init__(
+            "Alias {!r} points to unknown task {!r}".format(alias, target)
+        )
+
+
 class Failure(Exception):
     """
     Exception subclass representing failure of a command execution.

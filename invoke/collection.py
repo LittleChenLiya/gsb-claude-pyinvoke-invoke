@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .util import Lexicon, helpline
 
 from .config import merge_dicts, copy_dict
+from .exceptions import AliasCycleError, MissingAliasTargetError
 from .parser import Context as ParserContext
 from .tasks import Task
 
@@ -328,6 +329,63 @@ class Collection:
             msg = "'{}' cannot be the default because '{}' already is!"
             raise ValueError(msg.format(name, self.default))
 
+    def check_alias_cycles(self) -> None:
+        """
+        Preflight-check all alias definitions in this collection tree.
+
+        Walks the task and subcollection alias maps of this collection and,
+        recursively, those of every nested subcollection, resolving each alias
+        chain without executing any task bodies or modifying the collection.
+
+        Legal aliases - including aliases defined inside nested
+        subcollections - pass silently. The first problem found raises:
+
+        * `.AliasCycleError` when an alias chain loops back on itself. The
+          exception's ``chain`` attribute (and its message) contains the full
+          cycle, e.g. ``a -> b -> a``;
+        * `.MissingAliasTargetError` when an alias points at a name that does
+          not exist in its collection.
+
+        .. versionadded:: 3.1
+        """
+        self._check_alias_cycles(prefix="")
+
+    def _check_alias_cycles(self, prefix: str) -> None:
+        for lexicon in (self.tasks, self.collections):
+            for alias in lexicon.aliases:
+                self._check_alias_chain(lexicon, alias, prefix)
+        for name, coll in self.collections.items():
+            coll._check_alias_cycles(prefix="{}{}.".format(prefix, name))
+
+    def _check_alias_chain(
+        self, lexicon: Lexicon, alias: str, prefix: str
+    ) -> None:
+        # Follow the alias chain, remembering every link; revisiting a link
+        # means the chain loops.
+        chain = [alias]
+        seen = {alias}
+        current = alias
+        while current in lexicon.aliases:
+            target = lexicon.aliases[current]
+            # Multi-target aliases (not producible via add_task, but the
+            # Lexicon supports them) can't cycle by themselves; just make
+            # sure each of their targets exists.
+            if not isinstance(target, str):
+                for member in target:
+                    if member not in lexicon:
+                        raise MissingAliasTargetError(
+                            prefix + alias, prefix + member
+                        )
+                return
+            current = target
+            chain.append(current)
+            if current in seen:
+                raise AliasCycleError([prefix + x for x in chain])
+            seen.add(current)
+        # Chain ended on a non-alias; it must be a real entry in the lexicon.
+        if current not in lexicon:
+            raise MissingAliasTargetError(prefix + alias, prefix + current)
+
     def _split_path(self, path: str) -> Tuple[str, str]:
         """
         Obtain first collection + remainder, of a task path.
@@ -378,7 +436,7 @@ class Collection:
         return task, dict(config, **ours)
 
     def task_with_config(
-        self, name: Optional[str]
+        self, name: Optional[str], check_alias_cycles: bool = False
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Return task named ``name`` plus its configuration dict.
@@ -390,11 +448,21 @@ class Collection:
 
         See `~.Collection.__getitem__` for semantics of the ``name`` argument.
 
+        :param bool check_alias_cycles:
+            When ``True``, run `check_alias_cycles` as a preflight step
+            before performing the lookup, raising `.AliasCycleError` or
+            `.MissingAliasTargetError` if any alias in the collection tree is
+            broken. Defaults to ``False``, preserving the historical lookup
+            behavior (and return shape) exactly.
+
         :returns: Two-tuple of (`.Task`, `dict`).
 
         .. versionadded:: 1.0
+        .. versionchanged:: 3.1
+            Added the ``check_alias_cycles`` kwarg.
         """
-        # Our top level configuration
+        if check_alias_cycles:
+            self.check_alias_cycles()        # Our top level configuration
         ours = self.configuration()
         # Default task for this collection itself
         if not name:

@@ -5,11 +5,14 @@ from .collection import Collection  # noqa
 from .config import Config  # noqa
 from .context import Context, MockContext  # noqa
 from .exceptions import (  # noqa
+    AliasCycleError,
+    AliasResolutionError,
     AmbiguousEnvVar,
     AuthFailure,
     CollectionNotFound,
     CommandTimedOut,
     Exit,
+    MissingAliasTargetError,
     ParseError,
     PlatformError,
     ResponseNotAccepted,

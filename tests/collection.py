@@ -4,6 +4,7 @@ from functools import reduce
 from pytest import raises
 
 from invoke.collection import Collection
+from invoke.exceptions import AliasCycleError, MissingAliasTargetError
 from invoke.tasks import task, Task
 
 from _util import load, support_path
@@ -446,6 +447,153 @@ class Collection_:
             self.c.add_collection(Collection("whatever"))
             with raises(ValueError):
                 self.c["whatever"]
+
+    class check_alias_cycles:
+        "check_alias_cycles / alias preflight"
+
+        def setup_method(self):
+            self.calls = []
+
+            @task
+            def real(c):
+                self.calls.append("real")
+
+            @task
+            def other(c):
+                self.calls.append("other")
+
+            self.real = real
+            self.other = other
+            self.c = Collection()
+            self.c.add_task(real)
+            self.c.add_task(other)
+
+        def _snapshot(self, coll):
+            return (
+                dict(coll.tasks),
+                dict(coll.tasks.aliases),
+                dict(coll.collections),
+                dict(coll.collections.aliases),
+                coll.default,
+            )
+
+        def passes_when_no_aliases_exist(self):
+            self.c.check_alias_cycles()  # no exception
+
+        def passes_for_legal_aliases_in_nested_collections(self):
+            # Alias registered on a task inside a nested subcollection.
+            sub = Collection("sub")
+            sub.add_task(Task(_func, aliases=["b"]), "build")
+            inner = Collection("inner")
+            inner.add_task(Task(_func, aliases=["x"]), "exec")
+            sub.add_collection(inner)
+            self.c.add_collection(sub)
+            self.c.check_alias_cycles()  # no exception
+            # Legal aliases still resolve through normal lookup.
+            assert self.c["sub.b"] is sub["build"]
+            assert self.c["sub.inner.x"] is inner["exec"]
+
+        def reports_two_node_cycle_with_full_chain(self):
+            self.c.tasks.alias("a", to="b")
+            self.c.tasks.alias("b", to="a")
+            with raises(AliasCycleError) as info:
+                self.c.check_alias_cycles()
+            err = info.value
+            assert err.chain == ["a", "b", "a"]
+            assert "a -> b -> a" in str(err)
+
+        def reports_self_loop(self):
+            self.c.tasks.alias("lonely", to="lonely")
+            with raises(AliasCycleError) as info:
+                self.c.check_alias_cycles()
+            assert info.value.chain == ["lonely", "lonely"]
+
+        def reports_cycle_inside_nested_collection_with_path(self):
+            sub = Collection("sub")
+            sub.add_task(self.real)
+            sub.tasks.alias("a", to="b")
+            sub.tasks.alias("b", to="a")
+            self.c.add_collection(sub)
+            with raises(AliasCycleError) as info:
+                self.c.check_alias_cycles()
+            assert info.value.chain == ["sub.a", "sub.b", "sub.a"]
+
+        def reports_missing_target(self):
+            self.c.tasks.alias("ghost", to="nonexistent")
+            with raises(MissingAliasTargetError) as info:
+                self.c.check_alias_cycles()
+            err = info.value
+            assert err.alias == "ghost"
+            assert err.target == "nonexistent"
+            assert "nonexistent" in str(err)
+
+        def reports_missing_target_at_end_of_chain(self):
+            self.c.tasks.alias("first", to="second")
+            self.c.tasks.alias("second", to="gone")
+            with raises(MissingAliasTargetError) as info:
+                self.c.check_alias_cycles()
+            assert info.value.target == "gone"
+
+        def does_not_execute_tasks_or_mutate_collection(self):
+            self.c.tasks.alias("a", to="b")
+            self.c.tasks.alias("b", to="a")
+            before = self._snapshot(self.c)
+            with raises(AliasCycleError):
+                self.c.check_alias_cycles()
+            assert self.calls == []
+            assert self._snapshot(self.c) == before
+
+        def normal_lookup_keeps_existing_return_shape(self):
+            self.c.tasks.alias("alias-of-real", to="real")
+            # __getitem__ shape
+            assert self.c["real"] is self.real
+            assert self.c["alias-of-real"] is self.real
+            # task_with_config shape: (task, config-dict) two-tuple
+            found, config = self.c.task_with_config("alias-of-real")
+            assert found is self.real
+            assert isinstance(config, dict)
+
+    class task_with_config_alias_check_option:
+        "task_with_config(check_alias_cycles=...)"
+
+        def setup_method(self):
+            self.calls = []
+
+            @task
+            def real(c):
+                self.calls.append("real")
+
+            self.real = real
+            self.c = Collection()
+            self.c.add_task(real)
+
+        def option_defaults_to_off_and_lookup_succeeds(self):
+            # Even with a broken alias present, default lookups are untouched.
+            self.c.tasks.alias("a", to="b")
+            self.c.tasks.alias("b", to="a")
+            found, config = self.c.task_with_config("real")
+            assert found is self.real
+            assert isinstance(config, dict)
+            assert self.c["real"] is self.real
+
+        def enabled_option_raises_before_lookup_and_runs_nothing(self):
+            self.c.tasks.alias("a", to="b")
+            self.c.tasks.alias("b", to="a")
+            before = dict(self.c.tasks.aliases)
+            with raises(AliasCycleError) as info:
+                self.c.task_with_config("a", check_alias_cycles=True)
+            assert info.value.chain == ["a", "b", "a"]
+            assert self.calls == []
+            assert dict(self.c.tasks.aliases) == before
+
+        def enabled_option_passes_for_legal_nested_aliases(self):
+            sub = Collection("sub")
+            sub.add_task(Task(_func, aliases=["b"]), "build")
+            self.c.add_collection(sub)
+            found, _ = self.c.task_with_config(
+                "sub.b", check_alias_cycles=True
+            )
+            assert found is sub["build"]
 
     class to_contexts:
         def setup_method(self):
